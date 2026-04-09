@@ -9,10 +9,15 @@ class AzureAccess:
     """Azure access manager"""
     def __init__(self):
         self.az_command = check_azure_cli_install()
+        self.az_env = build_azure_cli_env()
+
+    def get_subprocess_env(self):
+        """Return the shared Azure CLI environment for child processes."""
+        return dict(self.az_env)
 
     def get_current_subscription_info(self):
         """Get current subscription info for connected account."""
-        raw_response = subprocess.run([self.az_command, "account", "show"], capture_output=True)
+        raw_response = subprocess.run([self.az_command, "account", "show"], capture_output=True, env=self.az_env)
         if raw_response.returncode == 0:
             output = raw_response.stdout
             return json.loads(output.decode('utf-8'))
@@ -20,7 +25,7 @@ class AzureAccess:
 
     def get_account_available_subscriptions(self):
         """Get list of available subscriptions."""
-        raw_response = subprocess.run([self.az_command, "account", "list"], capture_output=True)
+        raw_response = subprocess.run([self.az_command, "account", "list"], capture_output=True, env=self.az_env)
         if raw_response.returncode == 0:
             output = raw_response.stdout
             return json.loads(output.decode('utf-8'))
@@ -28,7 +33,7 @@ class AzureAccess:
 
     def set_active_subscription(self, subscription_id):
         """Set default subscription in environment to use."""
-        raw_response = subprocess.run([self.az_command, "account", "set", "--subscription", subscription_id], capture_output=True)
+        raw_response = subprocess.run([self.az_command, "account", "set", "--subscription", subscription_id], capture_output=True, env=self.az_env)
         return True if raw_response.returncode == 0 else None
 
     @staticmethod
@@ -41,7 +46,7 @@ class AzureAccess:
 
     def execute_az_command(self, *args):
         """Execute an arbitrary Azure CLI command."""
-        raw_response = subprocess.run([self.az_command, *args], capture_output=True)
+        raw_response = subprocess.run([self.az_command, *args], capture_output=True, env=self.az_env)
         if raw_response.returncode == 0:
             output = raw_response.stdout
             try:
@@ -52,10 +57,18 @@ class AzureAccess:
     
     def logout(self):
         """Remove established access by logging out the current user."""
-        raw_response = subprocess.run([self.az_command, "logout"], capture_output=True)
+        raw_response = subprocess.run([self.az_command, "logout"], capture_output=True, env=self.az_env)
         if raw_response.returncode == 0:
             return True
         return False
+
+def build_azure_cli_env():
+    """Build a shared Azure CLI environment that is writable inside Halberd."""
+    az_env = os.environ.copy()
+    az_config_dir = az_env.get("AZURE_CONFIG_DIR", os.path.abspath("./local/azure_cli"))
+    os.makedirs(az_config_dir, exist_ok=True)
+    az_env["AZURE_CONFIG_DIR"] = az_config_dir
+    return az_env
     
 def check_azure_cli_install():
     '''Function checks for installation of Azure cli on host'''

@@ -634,6 +634,10 @@ def execute_technique_callback(n_clicks, tactic, t_id, values, bool_on, file_con
         timestamp=datetime.datetime.now().isoformat())
     )
 
+    # Provide an internal execution identifier so long-running techniques can
+    # refresh their stored output after asynchronous work completes.
+    technique_input["_event_id"] = event_id
+
     # Execute technique    
     output = technique().execute(**technique_input)
     

@@ -80,6 +80,8 @@ class BaseTechnique(ABC):
                 raise ValueError(f"Missing required parameter: {param}")
         
         for param, value in params.items():
+            if param.startswith('_'):
+                continue
             if param not in required_params:
                 raise ValueError(f"Unknown parameter: {param}")
             
