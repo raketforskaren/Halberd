@@ -26,6 +26,7 @@ from .aws.aws_expose_s3_bucket_public import AWSExposeS3BucketPublic
 
 # Azure Techniques
 from .azure.azure_establish_access_via_device_code import AzureEstablishAccessViaDeviceCode
+from .azure.azure_establish_access_via_browser_login import AzureEstablishAccessViaBrowserLogin
 from .azure.azure_establish_access_as_user import AzureEstablishAccessAsUser
 from .azure.azure_establish_access_as_app import AzureEstablishAccessAsApp
 from .azure.azure_password_spray import AzurePasswordSpray

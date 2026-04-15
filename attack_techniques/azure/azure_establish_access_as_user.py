@@ -24,7 +24,7 @@ class AzureEstablishAccessAsUser(BaseTechnique):
                 sub_technique_name="User Account"
             )
         ]
-        super().__init__("Establish Access As User", "Authenticates to an Azure tenant using username and password credentials. The technique attempts programmatic authentication via the Azure CLI and falls back to interactive browser login if initial authentication fails. This supports scenarios where additional authentication prompts may be required. Successfully authenticated sessions return information about accessible subscriptions including subscription IDs, account details, and tenant associations. Commonly used during initial access after credential theft or phishing attacks.", mitre_techniques, azure_trm_technique)
+        super().__init__("Establish Access As User", "Authenticates to an Azure tenant using username and password credentials. This technique is intended for non-MFA Azure user accounts where direct Azure CLI credential-based login is permitted. For MFA-enabled accounts or tenants that require interactive authentication, use Establish Access via Browser Login instead. Successfully authenticated sessions return information about accessible subscriptions including subscription IDs, account details, and tenant associations.", mitre_techniques, azure_trm_technique)
         
 
     def execute(self, **kwargs: Any) -> Tuple[ExecutionStatus, Dict[str, Any]]:
@@ -44,9 +44,24 @@ class AzureEstablishAccessAsUser(BaseTechnique):
             az_command = AzureAccess().az_command
             raw_response = subprocess.run([az_command, "login", "-u", username, "-p", password], capture_output=True)
 
-            # if login attempt fails, launch interactive login
-            if raw_response.returncode == 1:
-                raw_response = subprocess.run([az_command, "login"], capture_output=True)
+            if raw_response.returncode != 0:
+                stderr_output = raw_response.stderr.decode("utf-8", errors="ignore").strip()
+                stdout_output = raw_response.stdout.decode("utf-8", errors="ignore").strip()
+                combined_output = f"{stderr_output}\n{stdout_output}".strip()
+                lowered_output = combined_output.lower()
+
+                if any(keyword in lowered_output for keyword in [
+                    "interactive authentication is needed",
+                    "multifactor authentication",
+                    "mfa",
+                    "conditional access",
+                    "device code",
+                    "browser"
+                ]):
+                    return ExecutionStatus.FAILURE, {
+                        "error": combined_output or str(raw_response.returncode),
+                        "message": "Azure CLI requires interactive authentication for this account. Use 'Establish Access via Browser Login' for MFA-enabled or Conditional Access-protected users."
+                    }
 
             if raw_response.returncode == 0:
                 output = raw_response.stdout
@@ -74,7 +89,7 @@ class AzureEstablishAccessAsUser(BaseTechnique):
                     }
             else:
                 return ExecutionStatus.FAILURE, {
-                    "error": str(raw_response.returncode),
+                    "error": raw_response.stderr.decode("utf-8", errors="ignore").strip() or str(raw_response.returncode),
                     "message": "Failed to establish access to Azure tenant"
                 }
         except Exception as e:
