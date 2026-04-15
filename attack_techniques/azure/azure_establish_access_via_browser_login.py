@@ -58,6 +58,7 @@ class AzureEstablishAccessViaBrowserLogin(BaseTechnique):
 
         try:
             tenant_id: str = kwargs.get("tenant_id", None)
+            subscription_id: str = kwargs.get("subscription_id", None)
             runtime_profile: str = kwargs.get("runtime_profile", "docker_macos_linux")
             azure_access = AzureAccess()
 
@@ -71,7 +72,7 @@ class AzureEstablishAccessViaBrowserLogin(BaseTechnique):
             current_access = azure_access.get_current_subscription_info()
 
             if current_access is None:
-                guidance = self._build_guidance(runtime_profile, tenant_id)
+                guidance = self._build_guidance(runtime_profile, tenant_id, subscription_id)
 
                 return ExecutionStatus.FAILURE, {
                     "error": {
@@ -91,6 +92,18 @@ class AzureEstablishAccessViaBrowserLogin(BaseTechnique):
                         "runtime_profile": runtime_profile
                     },
                     "message": "An Azure CLI session exists, but it is authenticated to a different tenant than requested"
+                }
+
+            if subscription_id not in [None, ""] and current_access.get("id") not in [subscription_id, None]:
+                return ExecutionStatus.FAILURE, {
+                    "error": {
+                        "expected_subscription_id": subscription_id,
+                        "active_subscription_id": current_access.get("id"),
+                        "azure_config_dir": azure_config_dir,
+                        "runtime_profile": runtime_profile,
+                        "guidance": self._build_guidance(runtime_profile, tenant_id, subscription_id)
+                    },
+                    "message": "An Azure CLI session exists, but it is using a different subscription than requested"
                 }
 
             return ExecutionStatus.SUCCESS, {
@@ -122,10 +135,10 @@ class AzureEstablishAccessViaBrowserLogin(BaseTechnique):
                 "type": "str",
                 "required": False,
                 "default": "docker_macos_linux",
-                "name": "Runtime Profile",
+                "name": "Deployment Environment",
                 "input_field_type": "select",
                 "input_list": [
-                    {"label": "Docker on macOS/Linux", "value": "docker_macos_linux"},
+                    {"label": "Docker on Mac/Linux", "value": "docker_macos_linux"},
                     {"label": "Docker on Windows VDI", "value": "docker_windows_vdi"}
                 ],
                 "description": "Used to tailor the Azure login guidance shown by Halberd"
@@ -135,29 +148,42 @@ class AzureEstablishAccessViaBrowserLogin(BaseTechnique):
                 "required": False,
                 "default": None,
                 "name": "Tenant ID (Optional)",
+                "description": "Enter this if the Azure login must land in a specific tenant",
+                "input_field_type": "text"
+            },
+            "subscription_id": {
+                "type": "str",
+                "required": False,
+                "default": None,
+                "name": "Subscription ID (Optional)",
+                "description": "Enter this if the Azure login must use a specific subscription",
                 "input_field_type": "text"
             }
         }
 
     @staticmethod
-    def _build_guidance(runtime_profile: str, tenant_id: str = None) -> list[str]:
+    def _build_guidance(runtime_profile: str, tenant_id: str = None, subscription_id: str = None) -> list[str]:
         login_command = "az login"
         if tenant_id not in [None, ""]:
             login_command = f"az login --tenant {tenant_id}"
 
+        subscription_step = f"Run `az account set --subscription {subscription_id}`." if subscription_id not in [None, ""] else "Run `az account list --all -o table` and identify the correct subscription ID, then run `az account set --subscription <subscription-id>`."
+
         profile_guidance = {
             "docker_macos_linux": [
                 "No active Azure CLI session is visible to Halberd.",
-                f"Run `{login_command}` on the host first.",
-                "If Halberd is running in Docker, mount your host Azure CLI config into the container.",
-                "Recommended docker-compose mount: `${HOME}/.azure:/home/halberd/.azure`."
+                f"On your Mac/Linux host, run `{login_command}` and complete the full browser and MFA sequence.",
+                subscription_step,
+                "Run `az account show` and confirm it returns the expected tenant and subscription.",
+                "Halberd in Docker must be able to read the host Azure CLI profile via the mount `${HOME}/.azure:/home/halberd/.azure`."
             ],
             "docker_windows_vdi": [
                 "No active Azure CLI session is visible to Halberd.",
-                f"Run `{login_command}` on the Windows host first.",
-                "For Windows VDI, browser-based Azure CLI auth is usually safer to reuse than WAM inside a Linux container.",
-                "If needed, disable WAM with `az config set core.enable_broker_on_windows=false` before logging in.",
-                "Recommended docker-compose mount on Windows: `${USERPROFILE}/.azure:/home/halberd/.azure`."
+                "On the Windows VDI host, first run `az config set core.enable_broker_on_windows=false` if WAM-based login is not reusable from Docker.",
+                f"Then run `{login_command}` and complete the full browser and MFA sequence.",
+                subscription_step,
+                "Run `az account show` and confirm it returns the expected tenant and subscription.",
+                "Halberd in Docker must be able to read the host Azure CLI profile via the mount `${USERPROFILE}/.azure:/home/halberd/.azure`."
             ]
         }
 
