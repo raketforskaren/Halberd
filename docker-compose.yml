@@ -13,6 +13,7 @@ services:
       - ./local:/app/local
       - ./output:/app/output
       - ./report:/app/report
+      - ${HOME}/.azure:/home/halberd/.azure
     environment:
       - HALBERD_HOST=0.0.0.0
       - HALBERD_PORT=8050

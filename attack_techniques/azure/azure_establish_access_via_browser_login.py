@@ -2,8 +2,7 @@ from ..base_technique import BaseTechnique, ExecutionStatus, MitreTechnique, Azu
 from ..technique_registry import TechniqueRegistry
 from typing import Dict, Any, Tuple
 from core.azure.azure_access import AzureAccess
-import subprocess
-import json
+import os
 
 
 @TechniqueRegistry.register
@@ -40,14 +39,14 @@ class AzureEstablishAccessViaBrowserLogin(BaseTechnique):
 
         technique_notes = [
             TechniqueNote("Use this technique for MFA-enabled Azure user accounts when username/password login is blocked or unsupported."),
-            TechniqueNote("This technique relies on the Azure CLI interactive browser login flow and works best when Halberd runs on a host that can launch a browser."),
-            TechniqueNote("If the tenant blocks device code flow through Conditional Access, browser login may still be a viable user-authentication path."),
-            TechniqueNote("Authentication must complete in the browser before Halberd can query the active Azure CLI session.")
+            TechniqueNote("This technique reuses an existing Azure CLI browser login instead of trying to launch a browser flow invisibly inside Halberd."),
+            TechniqueNote("When Halberd runs in Docker, mount your host Azure CLI config directory into the container so the existing Azure session is visible to the app."),
+            TechniqueNote("Run az login on the host first, then use this technique to validate and import the active Azure CLI session into Halberd.")
         ]
 
         super().__init__(
             "Establish Access via Browser Login",
-            "Authenticates to an Azure tenant using the Azure CLI's interactive browser login flow. This technique is intended for MFA-enabled user accounts where username/password authentication is unsupported and device code flow may be restricted by Conditional Access. After the user completes authentication in the browser, Halberd retrieves the active Azure CLI session and returns tenant and subscription details for follow-on Azure techniques.",
+            "Reuses an existing Azure CLI browser-authenticated session for MFA-enabled Azure user accounts. This technique is intended for environments where username/password authentication is unsupported and device code flow may be restricted by Conditional Access. Run az login on the host first, ensure the Azure CLI config is available to Halberd, then use this technique to validate and display the active Azure session for follow-on Azure techniques.",
             mitre_techniques,
             azure_trm_technique,
             references=technique_references,
@@ -59,80 +58,56 @@ class AzureEstablishAccessViaBrowserLogin(BaseTechnique):
 
         try:
             tenant_id: str = kwargs.get("tenant_id", None)
-            allow_no_subscriptions: bool = kwargs.get("allow_no_subscriptions", True)
-
+            runtime_profile: str = kwargs.get("runtime_profile", "docker_macos_linux")
             azure_access = AzureAccess()
-            az_command = azure_access.az_command
 
-            if not az_command:
+            if not azure_access.az_command:
                 return ExecutionStatus.FAILURE, {
                     "error": "Azure CLI not found",
                     "message": "Azure CLI is not installed or not accessible"
                 }
 
-            login_command = [az_command, "login"]
-
-            if tenant_id not in [None, ""]:
-                login_command.extend(["--tenant", tenant_id])
-
-            if allow_no_subscriptions:
-                login_command.append("--allow-no-subscriptions")
-
-            raw_response = subprocess.run(login_command, capture_output=True, text=True)
-
-            if raw_response.returncode != 0:
-                error_message = raw_response.stderr.strip() or raw_response.stdout.strip() or "Azure browser login did not complete successfully"
-                return ExecutionStatus.FAILURE, {
-                    "error": error_message,
-                    "message": "Failed to establish access to Azure tenant via browser login"
-                }
-
-            try:
-                struc_output = json.loads(raw_response.stdout)
-            except json.JSONDecodeError:
-                struc_output = None
-
-            if isinstance(struc_output, list):
-                try:
-                    output = {}
-                    for subscription in struc_output:
-                        output[subscription.get("id", "N/A")] = {
-                            "subscription_name": subscription.get("name", "N/A"),
-                            "subscription_id": subscription.get("id", "N/A"),
-                            "home_tenant_id": subscription.get("homeTenantId", "N/A"),
-                            "state": subscription.get("state", "N/A"),
-                            "identity": subscription.get("user", {}).get("name", "N/A"),
-                            "identity_type": subscription.get("user", {}).get("type", "N/A"),
-                        }
-                    return ExecutionStatus.SUCCESS, {
-                        "message": "Successfully established access to target Azure tenant via browser login",
-                        "value": output
-                    }
-                except Exception:
-                    return ExecutionStatus.PARTIAL_SUCCESS, {
-                        "message": "Successfully established access to target Azure tenant via browser login",
-                        "value": struc_output
-                    }
-
+            azure_config_dir = os.environ.get("AZURE_CONFIG_DIR", "Not set")
             current_access = azure_access.get_current_subscription_info()
-            if current_access:
-                return ExecutionStatus.SUCCESS, {
-                    "message": "Successfully established access to target Azure tenant via browser login",
-                    "value": {
-                        current_access.get("id", "N/A"): {
-                            "subscription_name": current_access.get("name", "N/A"),
-                            "subscription_id": current_access.get("id", "N/A"),
-                            "home_tenant_id": current_access.get("homeTenantId", "N/A"),
-                            "state": current_access.get("state", "N/A"),
-                            "identity": current_access.get("user", {}).get("name", "N/A"),
-                            "identity_type": current_access.get("user", {}).get("type", "N/A"),
-                        }
-                    }
+
+            if current_access is None:
+                guidance = self._build_guidance(runtime_profile, tenant_id)
+
+                return ExecutionStatus.FAILURE, {
+                    "error": {
+                        "azure_config_dir": azure_config_dir,
+                        "runtime_profile": runtime_profile,
+                        "guidance": guidance
+                    },
+                    "message": "No reusable Azure browser-authenticated session is currently available to Halberd"
                 }
 
-            return ExecutionStatus.PARTIAL_SUCCESS, {
-                "message": "Azure browser login completed, but Halberd could not parse subscription details",
-                "value": raw_response.stdout.strip()
+            if tenant_id not in [None, ""] and current_access.get("tenantId") not in [tenant_id, None]:
+                return ExecutionStatus.FAILURE, {
+                    "error": {
+                        "expected_tenant_id": tenant_id,
+                        "active_tenant_id": current_access.get("tenantId"),
+                        "azure_config_dir": azure_config_dir,
+                        "runtime_profile": runtime_profile
+                    },
+                    "message": "An Azure CLI session exists, but it is authenticated to a different tenant than requested"
+                }
+
+            return ExecutionStatus.SUCCESS, {
+                "message": "Successfully established access to target Azure tenant via existing browser-authenticated Azure CLI session",
+                "value": {
+                    current_access.get("id", "N/A"): {
+                        "subscription_name": current_access.get("name", "N/A"),
+                        "subscription_id": current_access.get("id", "N/A"),
+                        "home_tenant_id": current_access.get("homeTenantId", "N/A"),
+                        "state": current_access.get("state", "N/A"),
+                        "identity": current_access.get("user", {}).get("name", "N/A"),
+                        "identity_type": current_access.get("user", {}).get("type", "N/A"),
+                        "tenant_id": current_access.get("tenantId", "N/A"),
+                        "azure_config_dir": azure_config_dir,
+                        "runtime_profile": runtime_profile
+                    }
+                }
             }
 
         except Exception as e:
@@ -143,18 +118,47 @@ class AzureEstablishAccessViaBrowserLogin(BaseTechnique):
 
     def get_parameters(self) -> Dict[str, Dict[str, Any]]:
         return {
+            "runtime_profile": {
+                "type": "str",
+                "required": False,
+                "default": "docker_macos_linux",
+                "name": "Runtime Profile",
+                "input_field_type": "select",
+                "input_list": [
+                    {"label": "Docker on macOS/Linux", "value": "docker_macos_linux"},
+                    {"label": "Docker on Windows VDI", "value": "docker_windows_vdi"}
+                ],
+                "description": "Used to tailor the Azure login guidance shown by Halberd"
+            },
             "tenant_id": {
                 "type": "str",
                 "required": False,
                 "default": None,
                 "name": "Tenant ID (Optional)",
                 "input_field_type": "text"
-            },
-            "allow_no_subscriptions": {
-                "type": "bool",
-                "required": False,
-                "default": True,
-                "name": "Allow No Subscriptions",
-                "input_field_type": "bool"
             }
         }
+
+    @staticmethod
+    def _build_guidance(runtime_profile: str, tenant_id: str = None) -> list[str]:
+        login_command = "az login"
+        if tenant_id not in [None, ""]:
+            login_command = f"az login --tenant {tenant_id}"
+
+        profile_guidance = {
+            "docker_macos_linux": [
+                "No active Azure CLI session is visible to Halberd.",
+                f"Run `{login_command}` on the host first.",
+                "If Halberd is running in Docker, mount your host Azure CLI config into the container.",
+                "Recommended docker-compose mount: `${HOME}/.azure:/home/halberd/.azure`."
+            ],
+            "docker_windows_vdi": [
+                "No active Azure CLI session is visible to Halberd.",
+                f"Run `{login_command}` on the Windows host first.",
+                "For Windows VDI, browser-based Azure CLI auth is usually safer to reuse than WAM inside a Linux container.",
+                "If needed, disable WAM with `az config set core.enable_broker_on_windows=false` before logging in.",
+                "Recommended docker-compose mount on Windows: `${USERPROFILE}/.azure:/home/halberd/.azure`."
+            ]
+        }
+
+        return profile_guidance.get(runtime_profile, profile_guidance["docker_macos_linux"])
